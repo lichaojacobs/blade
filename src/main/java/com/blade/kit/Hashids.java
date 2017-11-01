@@ -27,6 +27,8 @@ public class Hashids {
     private static final String DEFAULT_SEPS     = "cfhistuCFHISTU";
     private static final String DEFAULT_SALT     = "";
 
+    private static final Pattern PATTERN = Pattern.compile("[\\w\\W]{1,12}");
+
     private static final int    DEFAULT_MIN_HASH_LENGTH = 0;
     private static final int    MIN_ALPHABET_LENGTH     = 16;
     private static final double SEP_DIV                 = 3.5;
@@ -176,7 +178,7 @@ public class Hashids {
         }
 
         final List<Long> matched = new ArrayList<Long>();
-        final Matcher    matcher = Pattern.compile("[\\w\\W]{1,12}").matcher(hexa);
+        final Matcher    matcher = PATTERN.matcher(hexa);
 
         while (matcher.find()) {
             matched.add(Long.parseLong("1" + matcher.group(), 16));
@@ -284,8 +286,8 @@ public class Hashids {
     }
 
     private long[] _decode(String hash, String alphabet) {
-        final ArrayList<Long> ret = new ArrayList<Long>();
-
+        final ArrayList<Long> ret = new ArrayList<>();
+        String shuffle = alphabet;
         int          i             = 0;
         final String regexp        = "[" + this.guards + "]";
         String       hashBreakdown = hash.replaceAll(regexp, " ");
@@ -307,9 +309,9 @@ public class Hashids {
                 String subHash, buffer;
                 for (final String aHashArray : hashArray) {
                     subHash = aHashArray;
-                    buffer = lottery + this.salt + alphabet;
-                    alphabet = Hashids.consistentShuffle(alphabet, buffer.substring(0, alphabet.length()));
-                    ret.add(Hashids.unhash(subHash, alphabet));
+                    buffer = lottery + this.salt + shuffle;
+                    shuffle = Hashids.consistentShuffle(shuffle, buffer.substring(0, shuffle.length()));
+                    ret.add(Hashids.unhash(subHash, shuffle));
                 }
             }
         }

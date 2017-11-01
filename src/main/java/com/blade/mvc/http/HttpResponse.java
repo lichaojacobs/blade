@@ -1,13 +1,11 @@
 package com.blade.mvc.http;
 
-import com.blade.kit.Assert;
-import com.blade.kit.DateKit;
+import com.blade.exception.NotFoundException;
 import com.blade.kit.StringKit;
-import com.blade.mvc.Const;
 import com.blade.mvc.WebContext;
 import com.blade.mvc.ui.ModelAndView;
-import com.blade.mvc.ui.template.TemplateEngine;
 import com.blade.mvc.wrapper.OutputStreamWrapper;
+import com.blade.server.netty.HttpConst;
 import com.blade.server.netty.ProgressiveFutureListener;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -17,7 +15,6 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.DefaultFileRegion;
 import io.netty.handler.codec.http.*;
 import io.netty.handler.codec.http.cookie.Cookie;
-import io.netty.handler.codec.http.cookie.ServerCookieEncoder;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 
@@ -25,11 +22,7 @@ import java.io.*;
 import java.nio.file.Files;
 import java.util.*;
 
-import static com.blade.mvc.Const.X_POWER_BY;
 import static io.netty.handler.codec.http.HttpHeaderValues.KEEP_ALIVE;
-import static io.netty.handler.codec.http.HttpHeaders.Names.*;
-import static io.netty.handler.codec.http.HttpResponseStatus.OK;
-import static io.netty.handler.codec.http.HttpVersion.HTTP_1_1;
 
 /**
  * HttpResponse
@@ -40,13 +33,13 @@ import static io.netty.handler.codec.http.HttpVersion.HTTP_1_1;
 @Slf4j
 public class HttpResponse implements Response {
 
-    private String                contentType    = Const.CONTENT_TYPE_HTML;
-    private HttpHeaders           headers        = new DefaultHttpHeaders();
-    private Set<Cookie>           cookies        = new HashSet<>();
-    private int                   statusCode     = 200;
-    private boolean               isCommit       = false;
-    private ChannelHandlerContext ctx            = null;
-    private TemplateEngine        templateEngine = null;
+    private HttpHeaders           headers     = new DefaultHttpHeaders(false);
+    private Set<Cookie>           cookies     = new HashSet<>(4);
+    private int                   statusCode  = 200;
+    private boolean               isCommit    = false;
+    private ChannelHandlerContext ctx         = null;
+    private CharSequence          contentType = null;
+    private CharSequence          dateString  = null;
 
     @Override
     public int statusCode() {
@@ -60,14 +53,14 @@ public class HttpResponse implements Response {
     }
 
     @Override
-    public Response contentType(@NonNull String contentType) {
+    public Response contentType(@NonNull CharSequence contentType) {
         this.contentType = contentType;
         return this;
     }
 
     @Override
     public String contentType() {
-        return this.contentType;
+        return null == this.contentType ? null : String.valueOf(this.contentType);
     }
 
     @Override
@@ -78,14 +71,14 @@ public class HttpResponse implements Response {
     }
 
     @Override
-    public Response header(@NonNull String name, @NonNull String value) {
+    public Response header(CharSequence name, CharSequence value) {
         this.headers.set(name, value);
         return this;
     }
 
     @Override
     public Response cookie(@NonNull com.blade.mvc.http.Cookie cookie) {
-        Cookie nettyCookie = new DefaultCookie(cookie.name(), cookie.value());
+        Cookie nettyCookie = new io.netty.handler.codec.http.cookie.DefaultCookie(cookie.name(), cookie.value());
         if (cookie.domain() != null) {
             nettyCookie.setDomain(cookie.domain());
         }
@@ -106,7 +99,7 @@ public class HttpResponse implements Response {
 
     @Override
     public Response cookie(@NonNull String name, @NonNull String value, int maxAge) {
-        Cookie nettyCookie = new DefaultCookie(name, value);
+        Cookie nettyCookie = new io.netty.handler.codec.http.cookie.DefaultCookie(name, value);
         nettyCookie.setPath("/");
         nettyCookie.setMaxAge(maxAge);
         this.cookies.add(nettyCookie);
@@ -115,7 +108,7 @@ public class HttpResponse implements Response {
 
     @Override
     public Response cookie(@NonNull String name, @NonNull String value, int maxAge, boolean secured) {
-        Cookie nettyCookie = new DefaultCookie(name, value);
+        Cookie nettyCookie = new io.netty.handler.codec.http.cookie.DefaultCookie(name, value);
         nettyCookie.setPath("/");
         nettyCookie.setMaxAge(maxAge);
         nettyCookie.setSecure(secured);
@@ -125,7 +118,7 @@ public class HttpResponse implements Response {
 
     @Override
     public Response cookie(@NonNull String path, @NonNull String name, @NonNull String value, int maxAge, boolean secured) {
-        Cookie nettyCookie = new DefaultCookie(name, value);
+        Cookie nettyCookie = new io.netty.handler.codec.http.cookie.DefaultCookie(name, value);
         nettyCookie.setMaxAge(maxAge);
         nettyCookie.setSecure(secured);
         nettyCookie.setPath(path);
@@ -140,54 +133,53 @@ public class HttpResponse implements Response {
             cookie.setValue("");
             cookie.setMaxAge(-1);
         });
+        Cookie nettyCookie = new io.netty.handler.codec.http.cookie.DefaultCookie(name, "");
+        nettyCookie.setMaxAge(-1);
+        this.cookies.add(nettyCookie);
         return this;
     }
 
     @Override
     public Map<String, String> cookies() {
-        Map<String, String> map = new HashMap<>();
+        Map<String, String> map = new HashMap<>(8);
         this.cookies.forEach(cookie -> map.put(cookie.name(), cookie.value()));
         return map;
     }
 
     @Override
     public void download(@NonNull String fileName, @NonNull File file) throws Exception {
-        try {
-            if (null == file || !file.exists() || !file.isFile()) {
-                Assert.throwException("please check the file is effective!");
-            }
-
-            RandomAccessFile raf        = new RandomAccessFile(file, "r");
-            long             fileLength = raf.length();
-            this.contentType = StringKit.mimeType(file.getName());
-
-            io.netty.handler.codec.http.HttpResponse httpResponse = new DefaultHttpResponse(HTTP_1_1, OK);
-            HttpHeaders                              httpHeaders  = httpResponse.headers().add(getDefaultHeader());
-
-            boolean keepAlive = WebContext.request().keepAlive();
-            if (keepAlive) {
-                httpResponse.headers().set(CONNECTION, HttpHeaders.Values.KEEP_ALIVE);
-            }
-            httpHeaders.set(CONTENT_TYPE, this.contentType);
-            httpHeaders.set("Content-Disposition", "attachment; filename=" + new String(fileName.getBytes("UTF-8"), "ISO8859_1"));
-            httpHeaders.set(CONTENT_LENGTH, fileLength);
-
-            // Write the initial line and the header.
-            ctx.write(httpResponse);
-
-            ChannelFuture sendFileFuture = ctx.write(new DefaultFileRegion(raf.getChannel(), 0, fileLength), ctx.newProgressivePromise());
-            // Write the end marker.
-            ChannelFuture lastContentFuture = ctx.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
-
-            sendFileFuture.addListener(ProgressiveFutureListener.build(raf));
-            // Decide whether to close the connection or not.
-            if (!keepAlive) {
-                lastContentFuture.addListener(ChannelFutureListener.CLOSE);
-            }
-            isCommit = true;
-        } catch (Exception e) {
-            throw e;
+        if (!file.exists() || !file.isFile()) {
+            throw new NotFoundException("Not found file: " + file.getPath());
         }
+
+        RandomAccessFile raf        = new RandomAccessFile(file, "r");
+        Long             fileLength = raf.length();
+        this.contentType = StringKit.mimeType(file.getName());
+
+        io.netty.handler.codec.http.HttpResponse httpResponse = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
+        HttpHeaders                              httpHeaders  = httpResponse.headers().add(getDefaultHeader());
+
+        boolean keepAlive = WebContext.request().keepAlive();
+        if (keepAlive) {
+            httpResponse.headers().set(HttpConst.CONNECTION, KEEP_ALIVE);
+        }
+        httpHeaders.set(HttpConst.CONTENT_TYPE, this.contentType);
+        httpHeaders.set("Content-Disposition", "attachment; filename=" + new String(fileName.getBytes("UTF-8"), "ISO8859_1"));
+        httpHeaders.setInt(HttpConst.CONTENT_LENGTH, fileLength.intValue());
+
+        // Write the initial line and the header.
+        ctx.write(httpResponse);
+
+        ChannelFuture sendFileFuture = ctx.write(new DefaultFileRegion(raf.getChannel(), 0, fileLength), ctx.newProgressivePromise());
+        // Write the end marker.
+        ChannelFuture lastContentFuture = ctx.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
+
+        sendFileFuture.addListener(ProgressiveFutureListener.build(raf));
+        // Decide whether to close the connection or not.
+        if (!keepAlive) {
+            lastContentFuture.addListener(ChannelFutureListener.CLOSE);
+        }
+        isCommit = true;
     }
 
     @Override
@@ -201,7 +193,7 @@ public class HttpResponse implements Response {
     public void render(@NonNull ModelAndView modelAndView) {
         StringWriter sw = new StringWriter();
         try {
-            templateEngine.render(modelAndView, sw);
+            WebContext.blade().templateEngine().render(modelAndView, sw);
             ByteBuf          buffer   = Unpooled.wrappedBuffer(sw.toString().getBytes("utf-8"));
             FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.valueOf(statusCode), buffer);
             this.send(response);
@@ -212,7 +204,7 @@ public class HttpResponse implements Response {
 
     @Override
     public void redirect(@NonNull String newUri) {
-        headers.set(HttpHeaders.Names.LOCATION, newUri);
+        headers.set(HttpConst.LOCATION, newUri);
         FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.FOUND);
         this.send(response);
     }
@@ -224,31 +216,41 @@ public class HttpResponse implements Response {
 
     @Override
     public void send(@NonNull FullHttpResponse response) {
-        response.headers().add(getDefaultHeader());
+        response.headers().set(getDefaultHeader());
+
         boolean keepAlive = WebContext.request().keepAlive();
-        // Add 'Content-Length' header only for a keep-alive connection.
-        response.headers().set(HttpHeaders.Names.CONTENT_LENGTH, response.content().readableBytes());
+
+        if (!response.headers().contains(HttpConst.CONTENT_LENGTH)) {
+            // Add 'Content-Length' header only for a keep-alive connection.
+            response.headers().set(HttpConst.CONTENT_LENGTH, String.valueOf(response.content().readableBytes()));
+        }
+
         if (!keepAlive) {
             ctx.write(response).addListener(ChannelFutureListener.CLOSE);
         } else {
-            response.headers().set(CONNECTION, KEEP_ALIVE);
-            ctx.write(response);
+            response.headers().set(HttpConst.CONNECTION, KEEP_ALIVE);
+            ctx.write(response, ctx.voidPromise());
         }
         isCommit = true;
     }
 
     private HttpHeaders getDefaultHeader() {
-        headers.set(DATE, DateKit.gmtDate());
-        headers.set(CONTENT_TYPE, this.contentType);
-        headers.set(X_POWER_BY, "blade-" + Const.VERSION);
-        this.cookies.forEach(cookie -> headers.add(SET_COOKIE, ServerCookieEncoder.LAX.encode(cookie)));
+        headers.set(HttpConst.DATE, dateString);
+        headers.set(HttpConst.CONTENT_TYPE, HttpConst.getContentType(this.contentType));
+        headers.set(HttpConst.X_POWER_BY, HttpConst.VERSION);
+        if (!headers.contains(HttpConst.SERVER)) {
+            headers.set(HttpConst.SERVER, HttpConst.VERSION);
+        }
+        if (this.cookies.size() > 0) {
+            this.cookies.forEach(cookie -> headers.add(HttpConst.SET_COOKIE, io.netty.handler.codec.http.cookie.ServerCookieEncoder.LAX.encode(cookie)));
+        }
         return headers;
     }
 
-    public static HttpResponse build(ChannelHandlerContext ctx, TemplateEngine templateEngine) {
+    public static HttpResponse build(ChannelHandlerContext ctx, CharSequence dateString) {
         HttpResponse httpResponse = new HttpResponse();
-        httpResponse.templateEngine = templateEngine;
         httpResponse.ctx = ctx;
+        httpResponse.dateString = dateString;
         return httpResponse;
     }
 

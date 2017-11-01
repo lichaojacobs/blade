@@ -3,22 +3,13 @@ package com.blade.mvc.wrapper;
 import com.blade.kit.DateKit;
 import com.blade.mvc.Const;
 import com.blade.mvc.WebContext;
+import com.blade.server.netty.HttpConst;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.DefaultFileRegion;
-import io.netty.handler.codec.http.DefaultHttpResponse;
-import io.netty.handler.codec.http.HttpHeaders;
-import io.netty.handler.codec.http.HttpResponse;
-import io.netty.handler.codec.http.LastHttpContent;
+import io.netty.handler.codec.http.*;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.io.OutputStream;
+import java.io.*;
 import java.nio.channels.FileChannel;
-
-import static io.netty.handler.codec.http.HttpHeaders.Names.*;
-import static io.netty.handler.codec.http.HttpResponseStatus.OK;
-import static io.netty.handler.codec.http.HttpVersion.HTTP_1_1;
 
 /**
  * OutputStream Wrapper
@@ -26,7 +17,7 @@ import static io.netty.handler.codec.http.HttpVersion.HTTP_1_1;
  * @author biezhi
  * @date 2017/8/2
  */
-public class OutputStreamWrapper {
+public class OutputStreamWrapper implements Closeable, Flushable {
 
     private OutputStream          outputStream;
     private File                  file;
@@ -54,28 +45,30 @@ public class OutputStreamWrapper {
         outputStream.write(b);
     }
 
-    public void write(byte b[], int off, int len) throws IOException {
-        outputStream.write(b, off, len);
+    public void write(byte[] bytes, int off, int len) throws IOException {
+        outputStream.write(bytes, off, len);
     }
 
+    @Override
     public void flush() throws IOException {
         outputStream.flush();
     }
 
+    @Override
     public void close() throws IOException {
         try {
             this.flush();
             FileChannel file       = new FileInputStream(this.file).getChannel();
             long        fileLength = file.size();
 
-            HttpResponse httpResponse = new DefaultHttpResponse(HTTP_1_1, OK);
-            httpResponse.headers().set(CONTENT_LENGTH, fileLength);
-            httpResponse.headers().set(DATE, DateKit.gmtDate());
-            httpResponse.headers().set(SERVER, "blade/" + Const.VERSION);
+            HttpResponse httpResponse = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
+            httpResponse.headers().set(HttpConst.CONTENT_LENGTH, fileLength);
+            httpResponse.headers().set(HttpConst.DATE, DateKit.gmtDate());
+            httpResponse.headers().set(HttpConst.SERVER, "blade/" + Const.VERSION);
 
             boolean keepAlive = WebContext.request().keepAlive();
             if (keepAlive) {
-                httpResponse.headers().set(CONNECTION, HttpHeaders.Values.KEEP_ALIVE);
+                httpResponse.headers().set(HttpConst.CONNECTION, HttpConst.KEEP_ALIVE);
             }
 
             // Write the initial line and the header.

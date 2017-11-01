@@ -1,14 +1,11 @@
 package com.blade.kit;
 
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
 import java.util.Date;
-import java.util.List;
 import java.util.stream.Stream;
 
 /**
@@ -16,8 +13,6 @@ import java.util.stream.Stream;
  * 2017/5/31
  */
 public class ReflectKit {
-
-    private static final List EMPTY_LIST = new ArrayList(0);
 
     public static <T> T newInstance(Class<T> cls) {
         try {
@@ -60,7 +55,8 @@ public class ReflectKit {
         } else if (type.equals(BigDecimal.class)) {
             return new BigDecimal(value);
         } else if (type.equals(Date.class)) {
-            return DateKit.toDate(value, "yyyy-MM-dd");
+            if (value.length() == 10) return DateKit.toDate(value, "yyyy-MM-dd");
+            return DateKit.toDateTime(value, "yyyy-MM-dd HH:mm:ss");
         } else if (type.equals(LocalDate.class)) {
             return DateKit.toLocalDate(value, "yyyy-MM-dd");
         } else if (type.equals(LocalDateTime.class)) {
@@ -70,15 +66,15 @@ public class ReflectKit {
     }
 
     /**
-     * @param bean   类实例
-     * @param method 方法名称
-     * @param args   方法参数
-     * @return
-     * @throws InvocationTargetException
-     * @throws IllegalArgumentException
-     * @throws IllegalAccessException
+     * invoke method
+     *
+     * @param bean   bean instance
+     * @param method method instance
+     * @param args   method arguments
+     * @return return method returned value
+     * @throws Exception throws Exception
      */
-    public static Object invokeMehod(Object bean, Method method, Object... args) throws Exception {
+    public static Object invokeMethod(Object bean, Method method, Object... args) throws Exception {
         Class<?>[] types    = method.getParameterTypes();
         int        argCount = args == null ? 0 : args.length;
         // 参数个数对不上

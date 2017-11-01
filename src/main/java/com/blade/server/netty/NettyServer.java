@@ -4,13 +4,12 @@ import com.blade.Blade;
 import com.blade.Environment;
 import com.blade.event.BeanProcessor;
 import com.blade.event.EventType;
-import com.blade.exception.ExceptionResolve;
-import com.blade.ioc.BeanDefine;
 import com.blade.ioc.DynamicContext;
 import com.blade.ioc.Ioc;
-import com.blade.ioc.OrderComparator;
 import com.blade.ioc.annotation.Bean;
-import com.blade.ioc.reader.ClassInfo;
+import com.blade.ioc.bean.BeanDefine;
+import com.blade.ioc.bean.ClassInfo;
+import com.blade.ioc.bean.OrderComparator;
 import com.blade.kit.BladeKit;
 import com.blade.kit.NamedThreadFactory;
 import com.blade.kit.ReflectKit;
@@ -18,21 +17,23 @@ import com.blade.kit.StringKit;
 import com.blade.mvc.Const;
 import com.blade.mvc.WebContext;
 import com.blade.mvc.annotation.Path;
+import com.blade.mvc.handler.DefaultExceptionHandler;
+import com.blade.mvc.handler.ExceptionHandler;
 import com.blade.mvc.hook.WebHook;
 import com.blade.mvc.route.RouteBuilder;
 import com.blade.mvc.route.RouteMatcher;
-import com.blade.mvc.ui.DefaultUI;
 import com.blade.mvc.ui.template.DefaultEngine;
 import com.blade.server.Server;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.epoll.EpollChannelOption;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.logging.LogLevel;
 import io.netty.handler.logging.LoggingHandler;
-import io.netty.handler.ssl.SslContext;
+import io.netty.util.ResourceLeakDetector;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.List;
@@ -61,7 +62,6 @@ public class NettyServer implements Server {
     private int                 backlog;
     private Channel             channel;
     private RouteBuilder        routeBuilder;
-    private ExceptionResolve    exceptionResolve;
     private List<BeanProcessor> processors;
 
     @Override
@@ -79,12 +79,13 @@ public class NettyServer implements Server {
         log.info("Environment: classpath      => {}", CLASSPATH);
 
         this.loadConfig(args);
-
         this.initConfig();
 
-        WebContext.init(blade, "/", false);
+        WebContext.init(blade, "/");
 
         this.initIoc();
+
+        this.shutdownHook();
 
         this.startServer(initStart);
 
@@ -102,7 +103,7 @@ public class NettyServer implements Server {
                 .filter(ReflectKit::isNormalClass)
                 .forEach(this::parseCls);
 
-        routeMatcher.register();
+        routeBuilder.register();
 
         this.processors.stream().sorted(new OrderComparator<>()).forEach(b -> b.preHandle(blade));
 
@@ -120,23 +121,34 @@ public class NettyServer implements Server {
 
     }
 
-    private void startServer(long startTime) throws Exception {
-        // Configure SSL.
-        SslContext sslCtx = null;
-        boolean    SSL    = false;
+    private void startServer(long startTime) throws InterruptedException {
+
+        ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.DISABLED);
 
         // Configure the server.
-        this.bossGroup = new NioEventLoopGroup(threadCount, bossExecutors);
-        this.workerGroup = new NioEventLoopGroup(workers, workerExecutors);
-
         ServerBootstrap b = new ServerBootstrap();
         b.option(ChannelOption.SO_BACKLOG, backlog);
         b.option(ChannelOption.SO_REUSEADDR, true);
+        b.childOption(ChannelOption.SO_REUSEADDR, true);
 
-        b.group(bossGroup, workerGroup)
-                .channel(NioServerSocketChannel.class)
-                .handler(new LoggingHandler(LogLevel.DEBUG))
-                .childHandler(new HttpServerInitializer(blade, exceptionResolve, sslCtx));
+        // enable epoll
+        if (BladeKit.epollIsAvailable()) {
+            log.info("⬢ Use EpollEventLoopGroup");
+            b.option(EpollChannelOption.SO_REUSEPORT, true);
+
+            NettyServerGroup nettyServerGroup = EpoolKit.group(threadCount, bossExecutors, workers, workerExecutors);
+            this.bossGroup = nettyServerGroup.getBoosGroup();
+            this.workerGroup = nettyServerGroup.getWorkerGroup();
+            b.group(bossGroup, workerGroup).channel(nettyServerGroup.getSocketChannel());
+        } else {
+            log.info("⬢ Use NioEventLoopGroup");
+            this.bossGroup = new NioEventLoopGroup(threadCount, bossExecutors);
+            this.workerGroup = new NioEventLoopGroup(workers, workerExecutors);
+            b.group(bossGroup, workerGroup).channel(NioServerSocketChannel.class);
+        }
+
+        b.handler(new LoggingHandler(LogLevel.DEBUG))
+                .childHandler(new HttpServerInitializer(blade, bossGroup.next()));
 
         String address = environment.get(ENV_KEY_SERVER_ADDRESS, DEFAULT_SERVER_ADDRESS);
         int    port    = environment.getInt(ENV_KEY_SERVER_PORT, DEFAULT_SERVER_PORT);
@@ -144,9 +156,9 @@ public class NettyServer implements Server {
         channel = b.bind(address, port).sync().channel();
         String appName = environment.get(ENV_KEY_APP_NAME, "Blade");
 
-        log.info("⬢ {} initialize successfully, Time elapsed: {} ms", appName, System.currentTimeMillis() - startTime);
+        log.info("⬢ {} initialize successfully, Time elapsed: {} ms", appName, (System.currentTimeMillis() - startTime));
         log.info("⬢ Blade start with {}:{}", address, port);
-        log.info("⬢ Open your web browser and navigate to {}://{}:{} ⚡", (SSL ? "https" : "http"), address.replace("0.0.0.0", "127.0.0.1"), port);
+        log.info("⬢ Open your web browser and navigate to {}://{}:{} ⚡", "http", address.replace(DEFAULT_SERVER_ADDRESS, LOCAL_IP_ADDRESS), port);
 
         blade.eventManager().fireEvent(EventType.SERVER_STARTED, blade);
     }
@@ -155,7 +167,7 @@ public class NettyServer implements Server {
     private void parseCls(Class<?> clazz) {
         if (null != clazz.getAnnotation(Bean.class)) blade.register(clazz);
         if (null != clazz.getAnnotation(Path.class)) {
-            if (null == clazz.getAnnotation(Bean.class)) {
+            if (null == blade.ioc().getBean(clazz)) {
                 blade.register(clazz);
             }
             Object controller = blade.ioc().getBean(clazz);
@@ -168,9 +180,15 @@ public class NettyServer implements Server {
         if (ReflectKit.hasInterface(clazz, BeanProcessor.class) && null != clazz.getAnnotation(Bean.class)) {
             this.processors.add((BeanProcessor) blade.ioc().getBean(clazz));
         }
-        if (ReflectKit.hasInterface(clazz, ExceptionResolve.class) && null != clazz.getAnnotation(Bean.class)) {
-            this.exceptionResolve = (ExceptionResolve) blade.ioc().getBean(clazz);
+        if (isExceptionHandler(clazz)) {
+            ExceptionHandler exceptionHandler = (ExceptionHandler) blade.ioc().getBean(clazz);
+            blade.exceptionHandler(exceptionHandler);
         }
+    }
+
+    private boolean isExceptionHandler(Class<?> clazz) {
+        return (null != clazz.getAnnotation(Bean.class) && (
+                ReflectKit.hasInterface(clazz, ExceptionHandler.class) || clazz.getSuperclass().equals(DefaultExceptionHandler.class)));
     }
 
     private void loadConfig(String[] args) {
@@ -183,28 +201,30 @@ public class NettyServer implements Server {
             bootEnv.props().forEach((key, value) -> environment.set(key.toString(), value));
         }
 
-        Optional<String> envArg = Stream.of(args).filter(s -> s.startsWith(Const.TERMINAL_BLADE_ENV)).findFirst();
-        envArg.ifPresent(arg -> {
-            String envName = "app-" + arg.split("=")[1] + ".properties";
-            log.info("current environment file is: {}", envName);
-            Environment customEnv = Environment.of(envName);
-            if (customEnv != null) {
-                customEnv.props().forEach((key, value) -> environment.set(key.toString(), value));
-            }
-        });
+        if (null != args) {
+            Optional<String> envArg = Stream.of(args).filter(s -> s.startsWith(Const.TERMINAL_BLADE_ENV)).findFirst();
+            envArg.ifPresent(arg -> {
+                String envName = "app-" + arg.split("=")[1] + ".properties";
+                log.info("current environment file is: {}", envName);
+                Environment customEnv = Environment.of(envName);
+                if (customEnv != null) {
+                    customEnv.props().forEach((key, value) -> environment.set(key.toString(), value));
+                }
+            });
+        }
 
         blade.register(environment);
 
         // load terminal param
         if (!BladeKit.isEmpty(args)) {
-            for (int i = 0; i < args.length; i++) {
-                if (args[i].startsWith(TERMINAL_SERVER_ADDRESS)) {
-                    int    pos     = args[i].indexOf(TERMINAL_SERVER_ADDRESS) + TERMINAL_SERVER_ADDRESS.length();
-                    String address = args[i].substring(pos);
+            for (String arg : args) {
+                if (arg.startsWith(TERMINAL_SERVER_ADDRESS)) {
+                    int    pos     = arg.indexOf(TERMINAL_SERVER_ADDRESS) + TERMINAL_SERVER_ADDRESS.length();
+                    String address = arg.substring(pos);
                     environment.set(ENV_KEY_SERVER_ADDRESS, address);
-                } else if (args[i].startsWith(TERMINAL_SERVER_PORT)) {
-                    int    pos  = args[i].indexOf(TERMINAL_SERVER_PORT) + TERMINAL_SERVER_PORT.length();
-                    String port = args[i].substring(pos);
+                } else if (arg.startsWith(TERMINAL_SERVER_PORT)) {
+                    int    pos  = arg.indexOf(TERMINAL_SERVER_PORT) + TERMINAL_SERVER_PORT.length();
+                    String port = arg.substring(pos);
                     environment.set(ENV_KEY_SERVER_PORT, port);
                 }
             }
@@ -217,7 +237,8 @@ public class NettyServer implements Server {
             blade.scanPackages(blade.bootClass().getPackage().getName());
         }
 
-        DefaultUI.printBanner();
+        // print banner text
+        this.printBanner();
 
         String statics = environment.get(ENV_KEY_STATIC_DIRS, "");
         if (StringKit.isNotBlank(statics)) {
@@ -225,10 +246,10 @@ public class NettyServer implements Server {
         }
 
         String templatePath = environment.get(ENV_KEY_TEMPLATE_PATH, "templates");
-        if (templatePath.charAt(0) == '/') {
+        if (templatePath.charAt(0) == HttpConst.CHAR_SLASH) {
             templatePath = templatePath.substring(1);
         }
-        if (templatePath.endsWith("/")) {
+        if (templatePath.endsWith(HttpConst.SLASH)) {
             templatePath = templatePath.substring(0, templatePath.length() - 1);
         }
         DefaultEngine.TEMPLATE_PATH = templatePath;
@@ -241,33 +262,76 @@ public class NettyServer implements Server {
 
         threadCount = environment.getInt(ENV_KEY_NETTY_THREAD_COUNT, 1);
         workers = environment.getInt(ENV_KEY_NETTY_WORKERS, 0);
-        backlog = environment.getInt(ENV_KEY_NETTY_SO_BACKLOG, 1024);
+        backlog = environment.getInt(ENV_KEY_NETTY_SO_BACKLOG, 8192);
+    }
+
+    private void shutdownHook() {
+        Runtime.getRuntime().addShutdownHook(new Thread(this::stop));
     }
 
     @Override
     public void stop() {
-        if (this.bossGroup != null) {
-            this.bossGroup.shutdownGracefully();
+        log.info("⬢ Blade shutdown ...");
+        try {
+            if (this.bossGroup != null) {
+                this.bossGroup.shutdownGracefully();
+            }
+            if (this.workerGroup != null) {
+                this.workerGroup.shutdownGracefully();
+            }
+            if (bossExecutors != null) {
+                bossExecutors.shutdown();
+            }
+            if (workerExecutors != null) {
+                workerExecutors.shutdown();
+            }
+            log.info("⬢ Blade shutdown successful");
+        } catch (Exception e) {
+            log.error("Blade shutdown error", e);
         }
-        if (this.workerGroup != null) {
-            this.workerGroup.shutdownGracefully();
-        }
-        if (bossExecutors != null) {
-            bossExecutors.shutdown();
-        }
-        if (workerExecutors != null) {
-            workerExecutors.shutdown();
+    }
+
+    @Override
+    public void stopAndWait() {
+        log.info("⬢ Blade shutdown ...");
+        try {
+            if (this.bossGroup != null) {
+                this.bossGroup.shutdownGracefully().sync();
+            }
+            if (this.workerGroup != null) {
+                this.workerGroup.shutdownGracefully().sync();
+            }
+            if (bossExecutors != null) {
+                bossExecutors.shutdown();
+            }
+            if (workerExecutors != null) {
+                workerExecutors.shutdown();
+            }
+            log.info("⬢ Blade shutdown successful");
+        } catch (Exception e) {
+            log.error("Blade shutdown error", e);
         }
     }
 
     @Override
     public void join() throws InterruptedException {
-        try {
-            channel.closeFuture().sync();
-        } catch (Exception e) {
-            e.printStackTrace();
-            this.stop();
+        channel.closeFuture().sync();
+    }
+
+    /**
+     * print blade start banner text
+     */
+    private void printBanner() {
+        StringBuilder text  = new StringBuilder();
+        String        space = "\t\t\t\t\t\t\t   ";
+        for (String s : Const.BANNER_TEXT) {
+            text.append("\r\n").append(space).append(s);
         }
+        text.append("\r\n")
+                .append(space)
+                .append(" :: Blade :: (v")
+                .append(Const.VERSION + ") \r\n");
+        System.out.println(text.toString());
     }
 
 }
